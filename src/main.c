@@ -46,6 +46,7 @@
 #include "scc.h"
 #include "rom.h"
 #include "disc.h"
+#include "sound_debug.h"
 
 #ifdef PICO
 #include "pico.h"
@@ -53,6 +54,43 @@
 #else
 #define FAST_FUNC(x)    x
 #endif
+
+// Sound buffer constants
+#define SOUND_BUFFER_SIZE      370  // Words per frame
+#define MAIN_SOUND_BUFFER_ADDR 0x1FD00  // Main sound buffer address
+#define ALT_SOUND_BUFFER_ADDR  0x1A100  // Alternate sound buffer address
+
+// Sound debug print tracking
+static int last_sound_msg_type = SOUND_MSG_NONE;
+static int buffer_write_count = 0;
+
+// Custom sound debug print function that maintains compact output
+void sound_debug_printf(int type, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    // End previous line if switching message types
+    if (last_sound_msg_type != type && last_sound_msg_type != SOUND_MSG_NONE) {
+        printf("\n");
+        buffer_write_count = 0;
+    }
+    
+    // For buffer writes, let the caller handle the formatting and line breaks
+    if (type == SOUND_MSG_BUFFER) {
+        // Just print the value with the format specified
+        vprintf(format, args);
+        buffer_write_count++;
+    } else {
+        // For control messages, use "Sound: " prefix
+        printf("Sound: ");
+        vprintf(format, args);
+        printf("\n");
+    }
+    
+    last_sound_msg_type = type;
+    fflush(stdout);
+    va_end(args);
+}
 
 
 #ifdef DEBUG
@@ -155,18 +193,49 @@ static void     via_ra_changed(uint8_t val)
                 update_overlay_layout();
         }
 
+        // Detect sound buffer changes
+        if ((oldval ^ val) & 0x08) {
+                int alt_buffer = (val & 0x08) ? 0 : 1; // bit 3 is 0 for alt buffer
+                sound_debug_printf(SOUND_MSG_CONTROL, "Buffer changed to %s", 
+                                  alt_buffer ? "alternate" : "main");
+        }
+
+        // Detect sound volume changes
+        if ((oldval & 0x07) != (val & 0x07)) {
+                int volume = val & 0x07;
+                sound_debug_printf(SOUND_MSG_CONTROL, "Volume changed to %d", volume);
+                
+                // Volume changes might indicate the start of a sound effect
+                // Dump current sound buffer to see what's in it
+                int using_alt_buffer = (val & 0x08) ? 0 : 1; // bit 3 is 0 for alt buffer
+                dump_sound_buffer(using_alt_buffer);
+        }
+
         oldval = val;
 }
 
 static void     via_rb_changed(uint8_t val)
 {
+        static uint8_t oldval = 0;
         // 7 = sndres (sound enable/disable)
         // 6 = hblank
         // 5 = mouse8 (in, mouse Y2)
         // 4 = mouse4 (in, mouse X2)
         // 3 = mouse7 (in, 0 = button pressed)
         // [2:0] = RTC controls
-        (void)val;
+        
+        // Detect sound enable/disable changes
+        if ((oldval ^ val) & 0x80) {
+                // From the documentation: "vSndEnb .EQU 7 ;0 = sound enabled, 1 = disabled"
+                int enabled = (val & 0x80) ? 0 : 1; // bit 7 is 0 = enabled, 1 = disabled
+                sound_debug_printf(SOUND_MSG_CONTROL, "%s", enabled ? "Enabled" : "Disabled");
+                
+                // Print the raw value to verify our interpretation
+                sound_debug_printf(SOUND_MSG_CONTROL, "Sound bit raw value: %d (bit 7 = %d)", 
+                                  val, (val & 0x80) ? 1 : 0);
+        }
+        
+        oldval = val;
 }
 
 static uint8_t  via_ra_in(void)
@@ -465,12 +534,271 @@ void    FAST_FUNC(cpu_write_byte)(unsigned int address, unsigned int value)
         printf("Ignoring write %02x to address %08x\n", value&0xff, address);
 }
 
+// Sound buffer detection
+static int in_sound_buffer_range(unsigned int address) {
+        // Main sound buffer at 0x1FD00, alt at 0x1A100, each 370 words
+        unsigned int addr = CLAMP_RAM_ADDR(address);
+        
+        // Check if in main sound buffer range
+        if (addr >= 0x1FD00 && addr < (0x1FD00 + SOUND_BUFFER_SIZE * 2))
+                return 1;
+        
+        // Check if in alternate sound buffer range
+        if (addr >= 0x1A100 && addr < (0x1A100 + SOUND_BUFFER_SIZE * 2))
+                return 1;
+        
+        return 0;
+}
+
+// Analyze sound buffer content to detect patterns
+static void analyze_sound_pattern(unsigned int sound_val, unsigned int addr) {
+    static uint8_t last_values[8] = {0};
+    static int pattern_index = 0;
+    static unsigned int pattern_repeat_count = 0;
+    static uint8_t detected_pattern[8] = {0};
+    static int pattern_length = 0;
+    static int pattern_detected = 0;
+    
+    // Add value to history
+    last_values[pattern_index] = sound_val;
+    pattern_index = (pattern_index + 1) % 8;
+    
+    // Only analyze after collecting some values
+    if (pattern_index == 0) {
+        // Check for repeating patterns like square waves
+        // Simple check for alternating high-low values (square wave)
+        if (last_values[0] == last_values[2] && 
+            last_values[0] == last_values[4] && 
+            last_values[0] == last_values[6] &&
+            last_values[1] == last_values[3] && 
+            last_values[1] == last_values[5] && 
+            last_values[1] == last_values[7] &&
+            last_values[0] != last_values[1]) {
+                
+            // Pattern detected - might be a square wave
+            if (!pattern_detected) {
+                pattern_detected = 1;
+                pattern_length = 2;
+                detected_pattern[0] = last_values[0];
+                detected_pattern[1] = last_values[1];
+                sound_debug_printf(SOUND_MSG_CONTROL, 
+                                  "BEEP PATTERN DETECTED: Alternating values %02x/%02x at addr %04x - likely square wave",
+                                  detected_pattern[0], detected_pattern[1], addr);
+                                  
+                // Dump both buffers to see what's happening
+                dump_sound_buffer(0); // Main buffer
+                dump_sound_buffer(1); // Alt buffer
+            }
+            pattern_repeat_count++;
+        }
+        // Check for 3-value patterns (common in PWM sound generation)
+        else if (last_values[0] == last_values[3] && 
+                 last_values[0] == last_values[6] &&
+                 last_values[1] == last_values[4] && 
+                 last_values[1] == last_values[7] &&
+                 last_values[2] == last_values[5]) {
+                 
+            if (!pattern_detected || pattern_length != 3) {
+                pattern_detected = 1;
+                pattern_length = 3;
+                detected_pattern[0] = last_values[0];
+                detected_pattern[1] = last_values[1];
+                detected_pattern[2] = last_values[2];
+                sound_debug_printf(SOUND_MSG_CONTROL, 
+                                  "BEEP PATTERN DETECTED: 3-value pattern %02x/%02x/%02x at addr %04x",
+                                  detected_pattern[0], detected_pattern[1], detected_pattern[2], addr);
+                                  
+                // Dump both buffers to see what's happening
+                dump_sound_buffer(0); // Main buffer
+                dump_sound_buffer(1); // Alt buffer
+            }
+            pattern_repeat_count++;
+        }
+        // Check for longer patterns
+        else if (last_values[0] == last_values[4] && 
+                 last_values[1] == last_values[5] &&
+                 last_values[2] == last_values[6] &&
+                 last_values[3] == last_values[7]) {
+                 
+            if (!pattern_detected || pattern_length != 4) {
+                pattern_detected = 1;
+                pattern_length = 4;
+                for (int i = 0; i < 4; i++) {
+                    detected_pattern[i] = last_values[i];
+                }
+                sound_debug_printf(SOUND_MSG_CONTROL, 
+                                  "BEEP PATTERN DETECTED: 4-value pattern %02x/%02x/%02x/%02x at addr %04x",
+                                  detected_pattern[0], detected_pattern[1], 
+                                  detected_pattern[2], detected_pattern[3], addr);
+            }
+            pattern_repeat_count++;
+        }
+        else {
+            // If no pattern detected in this window but we had one before,
+            // report that the pattern has ended
+            if (pattern_detected && pattern_repeat_count > 5) {
+                sound_debug_printf(SOUND_MSG_CONTROL, 
+                                  "BEEP PATTERN ENDED: After %d repetitions",
+                                  pattern_repeat_count);
+            }
+            pattern_detected = 0;
+            pattern_repeat_count = 0;
+        }
+    }
+}
+
+// Track buffer write sequence
+static unsigned int buffer_start_addr = 0;
+
+// This function dumps the entire current sound buffer (all 370 bytes)
+void dump_sound_buffer(int use_alt_buffer) {
+    unsigned int buffer_addr = use_alt_buffer ? ALT_SOUND_BUFFER_ADDR : MAIN_SOUND_BUFFER_ADDR;
+    
+    // Clear the terminal and move cursor to top
+    printf("\033[2J\033[H");
+    printf("===== SOUND BUFFER (%s @ 0x%04x) =====\n", 
+           use_alt_buffer ? "ALT" : "MAIN", buffer_addr);
+    
+    // Track some stats
+    int non_zero_values = 0;
+    int unique_values_count = 0;
+    uint8_t unique_values[256] = {0}; // Track which values appear in the buffer
+    uint8_t buffer_content[SOUND_BUFFER_SIZE]; // Store all values for analysis
+    
+    // First pass: read all values and gather statistics
+    for (int i = 0; i < SOUND_BUFFER_SIZE; i++) {
+        unsigned int addr = buffer_addr + (i * 2);
+        unsigned int word = RAM_RD16(CLAMP_RAM_ADDR(addr));
+        uint8_t val = (word >> 8) & 0xFF; // High byte is the sound value
+        
+        buffer_content[i] = val;
+        
+        if (val > 0) {
+            non_zero_values++;
+            if (unique_values[val] == 0) {
+                unique_values[val] = 1;
+                unique_values_count++;
+            }
+        }
+    }
+    
+    // Display the buffer content in hex - 16 bytes per line
+    for (int i = 0; i < SOUND_BUFFER_SIZE; i += 16) {
+        // Print address
+        printf("%04x: ", buffer_addr + (i * 2));
+        
+        // Print hex values (16 per line)
+        for (int j = 0; j < 16 && (i + j) < SOUND_BUFFER_SIZE; j++) {
+            printf("%02x ", buffer_content[i + j]);
+        }
+        
+        // Print ASCII representation
+        printf(" |");
+        for (int j = 0; j < 16 && (i + j) < SOUND_BUFFER_SIZE; j++) {
+            char c = buffer_content[i + j];
+            // Print as ASCII if it's printable, otherwise print a dot
+            printf("%c", (c >= 32 && c <= 126) ? c : '.');
+        }
+        printf("|\n");
+    }
+    
+    // Look for patterns in the data
+    printf("\nPattern Analysis:\n");
+    if (unique_values_count <= 3) {
+        // Print the unique values found
+        printf("Found %d unique non-zero values: ", unique_values_count);
+        for (int i = 0; i < 256; i++) {
+            if (unique_values[i]) {
+                printf("0x%02x ", i);
+            }
+        }
+        printf("\n");
+        
+        // Check for repeating patterns
+        if (non_zero_values > 0) {
+            int pattern_length = 0;
+            uint8_t pattern[16]; // Store potential pattern
+            
+            // Try to detect pattern lengths from 1 to 8
+            for (int len = 1; len <= 8; len++) {
+                int matches = 1; // Assume it matches until proven otherwise
+                
+                // Check if buffer content repeats with this length
+                for (int i = len; i < SOUND_BUFFER_SIZE; i++) {
+                    if (buffer_content[i] != buffer_content[i % len]) {
+                        matches = 0;
+                        break;
+                    }
+                }
+                
+                if (matches) {
+                    pattern_length = len;
+                    for (int i = 0; i < len; i++) {
+                        pattern[i] = buffer_content[i];
+                    }
+                    break;
+                }
+            }
+            
+            // If we found a pattern, display it
+            if (pattern_length > 0) {
+                printf("Repeating pattern detected (length %d): ", pattern_length);
+                for (int i = 0; i < pattern_length; i++) {
+                    printf("%02x ", pattern[i]);
+                }
+                printf("\n");
+            }
+        }
+    } else {
+        printf("Buffer contains %d unique values (too many to enumerate)\n", unique_values_count);
+    }
+    
+    printf("\n===== %d non-zero values (of %d) =====\n", non_zero_values, SOUND_BUFFER_SIZE);
+}
+
 void    FAST_FUNC(cpu_write_word)(unsigned int address, unsigned int value)
 {
         if (IS_RAM(address)) {
+                // Check if writing to sound buffer
+                if (in_sound_buffer_range(address)) {
+                        // Mac sound buffer uses high byte for PWM value
+                        unsigned int sound_val = (value >> 8) & 0xFF;
+                        unsigned int addr = CLAMP_RAM_ADDR(address);
+                        
+                        // Analyze all sound buffer writes for patterns
+                        analyze_sound_pattern(sound_val, addr);
+                        
+                        // Only print for non-zero values to reduce noise
+                        if (sound_val > 0) {
+                            // Record the first address in a new sequence
+                            if (last_sound_msg_type != SOUND_MSG_BUFFER) {
+                                buffer_start_addr = addr;
+                            }
+                            
+                            // Start new line with address every 16 values
+                            if (buffer_write_count % 16 == 0) {
+                                if (buffer_write_count > 0) {
+                                    printf("\n");
+                                }
+                                printf("Sound: Buffer [%04x]: ", buffer_start_addr);
+                                buffer_start_addr = addr; // Update start address for this line
+                            }
+                            
+                            sound_debug_printf(SOUND_MSG_BUFFER, " %02x", sound_val);
+                        }
+                }
+                
                 RAM_WR16(CLAMP_RAM_ADDR(address), value);
                 return;
         }
+        
+        // Reset sound message tracking for other output
+        if (last_sound_msg_type != SOUND_MSG_NONE) {
+                printf("\n");
+                last_sound_msg_type = SOUND_MSG_NONE;
+                buffer_write_count = 0;
+        }
+        
         printf("Ignoring write %04x to address %08x\n", value&0xffff, address);
 }
 
@@ -583,6 +911,11 @@ int     umac_init(void *ram_base, void *rom_base, disc_descr_t discs[DISC_NUM_DR
         };
         scc_init(&scb);
         disc_init(discs);
+        
+        // Print sound buffer address ranges
+        printf("Monitoring sound buffer areas: main=%04x-%04x, alt=%04x-%04x\n",
+               0x1FD00, 0x1FD00 + SOUND_BUFFER_SIZE * 2,
+               0x1A100, 0x1A100 + SOUND_BUFFER_SIZE * 2);
 
         return 0;
 }
@@ -701,6 +1034,10 @@ void    umac_disc_ejected(void)
 /* Run the emulator for about a frame.
  * Returns 0 for not-done, 1 when an exit/done condition arises.
  */
+// Flag to enable continuous sound buffer dumping
+static int enable_continuous_dump = 0;
+static int current_buffer_to_dump = 0; // 0=main, 1=alt
+
 int     umac_loop(void)
 {
         setjmp(main_loop_jb);
@@ -713,7 +1050,21 @@ int     umac_loop(void)
         via_tick(global_time_us);
         mouse_tick();
         kbd_check_work();
+        
+        // If continuous buffer dumping is enabled, dump the buffer on each loop iteration
+        if (enable_continuous_dump) {
+            // We'll alternate between main and alt buffer on each iteration
+            dump_sound_buffer(current_buffer_to_dump);
+            current_buffer_to_dump = !current_buffer_to_dump;
+        }
 
 	return sim_done;
+}
+
+// Toggle continuous sound buffer dumping on/off
+void umac_toggle_sound_dump(void) {
+    enable_continuous_dump = !enable_continuous_dump;
+    printf("Continuous sound buffer dumping %s\n", 
+           enable_continuous_dump ? "ENABLED" : "DISABLED");
 }
 

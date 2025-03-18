@@ -30,12 +30,18 @@
 #include <stdio.h>
 
 #include "via.h"
+#include "sound_debug.h"
 
 #ifdef DEBUG
 #define VDBG(...)       printf(__VA_ARGS__)
 #else
 #define VDBG(...)       do {} while(0)
 #endif
+
+// Track Timer 1 configuration for sound generation
+static uint16_t timer1_value = 0;  // Combined value from T1CH and T1CL
+static uint8_t timer1_acr = 0;     // ACR register value
+static int timer1_sound_mode = 0;  // Whether Timer 1 is in square wave mode
 
 #define VERR(...)       fprintf(stderr, __VA_ARGS__)
 
@@ -223,6 +229,69 @@ void    via_write(unsigned int address, uint8_t data)
         } break;
         case VIA_PCR:
                 VDBG("VIA PCR %02x\n", data);
+                break;
+        case VIA_ACR:
+                // Save ACR value and check if Timer 1 is in square wave mode
+                timer1_acr = data;
+                int old_sound_mode = timer1_sound_mode;
+                timer1_sound_mode = ((data & 0xC0) == 0xC0) ? 1 : 0;
+                
+                // Report changes to square wave mode
+                if (timer1_sound_mode != old_sound_mode) {
+                    if (timer1_sound_mode) {
+                        float freq_hz = 0;
+                        if (timer1_value > 0) {
+                            // Calculate frequency based on the formula from documentation:
+                            // frequency = 1 / (2 * 1.2766 usec * timer1_value)
+                            freq_hz = 1000000.0f / (2 * 1.2766f * timer1_value);
+                        }
+                        
+                        sound_debug_printf(SOUND_MSG_CONTROL, 
+                                          "Timer 1 ENABLED for square-wave output mode, value=%04x (%d), freq=%.1f Hz", 
+                                          timer1_value, timer1_value, freq_hz);
+                    } else {
+                        sound_debug_printf(SOUND_MSG_CONTROL, "Timer 1 DISABLED for square-wave output");
+                    }
+                }
+                break;
+                
+        case VIA_T1CL:
+                // Store low byte of Timer 1 value
+                timer1_value = (timer1_value & 0xFF00) | data;
+                sound_debug_printf(SOUND_MSG_CONTROL, "Timer 1 counter low byte=%02x, full value now %04x", 
+                                  data, timer1_value);
+                break;
+                
+        case VIA_T1CH:
+                // Store high byte of Timer 1 value 
+                timer1_value = (timer1_value & 0x00FF) | (data << 8);
+                
+                // When high byte is written, timer starts
+                float freq_hz = 0;
+                if (timer1_value > 0) {
+                    freq_hz = 1000000.0f / (2 * 1.2766f * timer1_value);
+                }
+                
+                sound_debug_printf(SOUND_MSG_CONTROL, 
+                                 "Timer 1 counter high byte=%02x, full value now %04x (%d), freq=%.1f Hz", 
+                                 data, timer1_value, timer1_value, freq_hz);
+                
+                // If Timer 1 is in square wave mode, this might be starting a beep
+                if (timer1_sound_mode) {
+                    sound_debug_printf(SOUND_MSG_CONTROL, 
+                                     "BEEP START: Timer 1 updated while in square wave mode, freq=%.1f Hz", 
+                                     freq_hz);
+                }
+                break;
+                
+        case VIA_T1LL:
+                // Store low byte of Timer 1 latch
+                sound_debug_printf(SOUND_MSG_CONTROL, "Timer 1 latch low byte=%02x", data);
+                break;
+                
+        case VIA_T1LH:
+                // Store high byte of Timer 1 latch
+                sound_debug_printf(SOUND_MSG_CONTROL, "Timer 1 latch high byte=%02x", data);
                 break;
         default:
                 VDBG("[VIA: unhandled WR %02x to %s (reg 0x%x)]\n", data, rname, r);

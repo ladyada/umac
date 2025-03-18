@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Matt Evans
+ * Copyright 2025
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation files
@@ -22,36 +22,18 @@
  * SOFTWARE.
  */
 
-#ifndef UMAC_H
-#define UMAC_H
+#ifndef SOUND_DEBUG_H
+#define SOUND_DEBUG_H
 
-#include "disc.h"
-#include "via.h"
-#include "machw.h"
+// Message types for sound_debug_printf
+#define SOUND_MSG_NONE     0
+#define SOUND_MSG_CONTROL  1
+#define SOUND_MSG_BUFFER   2
 
-int     umac_init(void *_ram_base, void *_rom_base, disc_descr_t discs[DISC_NUM_DRIVES]);
-int     umac_loop(void);
-void    umac_reset(void);
-void    umac_opt_disassemble(int enable);
-void    umac_mouse(int deltax, int deltay, int button);
-void    umac_kbd_event(uint8_t scancode, int down);
-void    umac_toggle_sound_dump(void);
+// Custom sound debug print function that maintains compact output
+void sound_debug_printf(int type, const char *format, ...);
 
-static inline void      umac_vsync_event(void)
-{
-        via_caX_event(2);
-}
+// Dump the entire sound buffer (all 370 bytes)
+void dump_sound_buffer(int use_alt_buffer);
 
-static inline void      umac_1hz_event(void)
-{
-        via_caX_event(1);
-}
-
-/* Return the offset into RAM of the current display buffer */
-static inline unsigned int      umac_get_fb_offset(void)
-{
-        /* FIXME: Implement VIA RA6/vid.pg2 */
-        return RAM_SIZE - ((DISP_WIDTH * DISP_HEIGHT / 8) + 0x380);
-}
-
-#endif
+#endif /* SOUND_DEBUG_H */

@@ -291,6 +291,16 @@ int     main(int argc, char *argv[])
 
                         case SDL_KEYDOWN:
                         case SDL_KEYUP: {
+                                // Check for special key combinations first
+                                if (event.type == SDL_KEYDOWN) {
+                                    // F9 toggles continuous sound buffer dumping
+                                    if (event.key.keysym.scancode == SDL_SCANCODE_F9) {
+                                        umac_toggle_sound_dump();
+                                        break; // Don't pass to Mac
+                                    }
+                                }
+                                
+                                // Regular key handling
                                 int c = SDLScan2MacKeyCode(event.key.keysym.scancode);
                                 c = (c << 1) | 1;
                                 printf("Key 0x%x -> 0x%x\n", event.key.keysym.scancode, c);
@@ -299,8 +309,8 @@ int     main(int argc, char *argv[])
                         } break;
 
                         case SDL_MOUSEMOTION:
-                                mousex = event.motion.xrel;
-                                mousey = -event.motion.yrel;
+                                mousex = -event.motion.xrel;
+                                mousey = event.motion.yrel;
                                 break;
 
                         case SDL_MOUSEBUTTONDOWN:
